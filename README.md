@@ -27,22 +27,50 @@ Session source priority (first non-empty wins):
 | `Session-Id` / `Session_id` | codex CLI |
 | `Thread-Id` / `Thread_id` | codex CLI thread (= conversation) |
 | `X-Claude-Code-Session-Id` | claude code |
-| `X-DeepSeek-Harness-Session-Id` | dsh / deepseek-harness |
+| `X-DeepSeek-Harness-Session-Id` | dsh / deepseek-harness (native provider) |
+| `X-Session-Affinity` | dsh pi-ai (anthropic-messages / openai-completions) |
 | `X-Session-Id` | generic / opencode-ish clients |
+| `X-Client-Request-Id` | last resort (dsh pi-ai openai-responses) |
 
 Rules:
 
 - A client-sent `x-opencode-session` (real opencode CLI) is authoritative and
   never overridden.
-- Per-call IDs (`X-Client-Request-Id`, the `x-opencode-request` analogue) are
-  deliberately not mapped — using them as the session would break stickiness.
-- No header at all → no-op. There is no global static fallback: collapsing
-  every conversation into one session would defeat per-conversation routing.
+- A client-supplied header always outranks the metadata fallback below; a
+  request that identifies itself is never overridden.
+- No header at all → the **metadata fallback** below, then no-op.
 
-Verified live against zen: `muse-free` (codex `/v1/responses` path, client
-`Session-Id`) and `mimo-free` (openai-compat `/v1/chat/completions` path,
-client `X-DeepSeek-Harness-Session-Id`) both arrive upstream carrying the
-mapped `X-Opencode-Session`.
+### Metadata fallback
+
+Some clients send no session header at all. DeepSeek Harness is the motivating
+case: its pi-ai transport gates session headers behind `sendSessionAffinityHeaders`,
+which the dsh adapter marks `withhold` — so nothing reaches the wire and there is
+nothing to map.
+
+For those requests the plugin reads `Metadata.canonical_session_id` from the
+interceptor payload, which the host computes from the source protocol and the
+client's own session id (`claude:<uuid>`, `codex:<id>`, …). It is populated only
+on the **after-auth** pass, which is why it is a fallback rather than a source.
+
+`derived_session_id` and `lcp_affinity_session_id` are deliberately **not** used:
+the former is absent from this payload on v7.2.157, and core documents the latter
+as unusable for provider conversation identity.
+
+**Known limitation.** `canonical_session_id` is stateless: two independent
+conversations whose content is byte-identical (same opening message, same tools)
+hash to the same value, so they share one upstream session. This affects
+prompt-cache affinity only, never correctness. Distinguishing such conversations
+requires the client to send a real session id.
+
+Verified live against zen:
+
+- `muse-free` (codex `/v1/responses`, client `Session-Id`) and `mimo-free`
+  (openai-compat `/v1/chat/completions`, client `X-DeepSeek-Harness-Session-Id`)
+  arrive upstream carrying the mapped `X-Opencode-Session`.
+- `deepseek-flash` with **no** session header at all (dsh 0.1.5,
+  `/v1/chat/completions`) now returns 200 instead of upstream
+  `MissingSessionID` 400; the derived id stays stable as a conversation grows
+  turn by turn and differs between conversations.
 
 ## Capability
 
@@ -109,7 +137,7 @@ go vet . && go test ./...
 2. Package `<id>_<version>_<goos>_<goarch>.zip` with the library at the zip
    root named `opencode-session-mapper.so`.
 3. Generate `checksums.txt` (sha256 of the zip).
-4. `gh release create v0.1.0 opencode-session-mapper_0.1.0_linux_amd64.zip checksums.txt`
+4. `gh release create v0.3.0 opencode-session-mapper_0.3.0_linux_amd64.zip checksums.txt`
 5. Bump `version` in `registry.json`.
 
 ## License

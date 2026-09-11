@@ -8,7 +8,7 @@ set -euo pipefail
 
 SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PLUGIN_NAME="opencode-session-mapper"
-PLUGIN_VERSION="${PLUGIN_VERSION:-0.1.0}"
+PLUGIN_VERSION="${PLUGIN_VERSION:-0.3.0}"
 OUT_DIR="${PLUGIN_OUT_DIR:-${SRC_DIR}/../../plugins/linux/amd64}"
 
 # Runtime container is Debian (glibc): must build with glibc toolchain, not alpine/musl.

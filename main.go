@@ -66,16 +66,20 @@ const (
 // without it may error).
 //
 // Deliberately EXCLUDED:
-//   - X-Client-Request-Id: unique per call (like x-opencode-request), not stable.
 //   - Conversation_id: set by the server itself, not the client.
 var sessionSources = []string{
-	"Session-Id",                   // codex CLI (also matches session_id case-insensitively? no: see below)
-	"Session_id",                   // codex CLI underscore variant (EqualFold misses _ vs -)
-	"Thread-Id",                    // codex CLI thread = conversation
-	"Thread_id",                    // underscore variant
-	"X-Claude-Code-Session-Id",     // claude code
-	"X-DeepSeek-Harness-Session-Id", // dsh / deepseek-harness
-	"X-Session-Id",                 // generic (opencode-ish clients, aicoding-proxy default)
+	"Session-Id",                    // codex CLI (also matches session_id case-insensitively? no: see below)
+	"Session_id",                    // codex CLI underscore variant (EqualFold misses _ vs -)
+	"Thread-Id",                     // codex CLI thread = conversation
+	"Thread_id",                     // underscore variant
+	"X-Claude-Code-Session-Id",      // claude code
+	"X-DeepSeek-Harness-Session-Id", // dsh / deepseek-harness native provider
+	"X-Session-Affinity",            // dsh pi-ai (anthropic-messages, openai-completions)
+	"X-Session-Id",                  // generic (opencode-ish clients, aicoding-proxy default)
+	// Last resort: dsh's pi-ai openai-responses path stamps the session id here
+	// (pi-ai sends it alongside x-session-affinity/x-session-id, which those
+	// clients may not use). Ranked last because other tools set it per call.
+	"X-Client-Request-Id",
 }
 
 type envelope struct {
@@ -111,6 +115,10 @@ type capabilities struct {
 type interceptRequest struct {
 	RequestID string              `json:"RequestID"`
 	Headers   map[string][]string `json:"Headers"`
+	// Metadata carries host-computed request facts. Populated only on the
+	// after-auth pass (request.intercept_after), where it includes
+	// canonical_session_id — see sessionFallback.
+	Metadata map[string]any `json:"Metadata"`
 }
 
 type interceptResponse struct {
@@ -227,6 +235,9 @@ func interceptHeaders(payload []byte) ([]byte, error) {
 		}
 	}
 	if session == "" {
+		session = sessionFallback(req.Metadata)
+	}
+	if session == "" {
 		return empty, nil
 	}
 	out := map[string][]string{targetSessionHeader: {session}}
@@ -235,6 +246,37 @@ func interceptHeaders(payload []byte) ([]byte, error) {
 		out[targetClientHeader] = []string{defaultClientValue}
 	}
 	return okEnvelopeJSON(interceptResponse{Headers: out})
+}
+
+// sessionFallback returns the host-computed conversation identity for clients
+// that send no session header of their own (notably DeepSeek Harness, whose
+// pi-ai transport gates session headers behind a switch its adapter withholds —
+// so the wire carries nothing to map).
+//
+// canonical_session_id is built by the core from the source protocol and the
+// client's own session id, yielding e.g. "claude:<uuid>" or "codex:<id>". It is
+// populated only on the after-auth pass, which is why this is a fallback and
+// not a source: a request that already carries a recognized header still wins
+// on the before-auth pass, unchanged.
+//
+// Only consulted when every client-supplied source was absent, so a client
+// that does identify itself is never overridden. derived_session_id and
+// lcp_affinity_session_id are deliberately NOT used: the former is absent from
+// this payload on v7.2.157, and core documents the latter as unusable for
+// provider conversation identity.
+func sessionFallback(metadata map[string]any) string {
+	if metadata == nil {
+		return ""
+	}
+	v, ok := metadata["canonical_session_id"]
+	if !ok {
+		return ""
+	}
+	s, ok := v.(string)
+	if !ok {
+		return ""
+	}
+	return strings.TrimSpace(s)
 }
 
 func okEnvelopeJSON(result any) ([]byte, error) {
