@@ -52,7 +52,13 @@ const abiVersion uint32 = 1
 
 const (
 	pluginID      = "opencode-session-mapper"
-	pluginVersion = "0.1.0"
+	pluginVersion = "0.3.0"
+
+	// Interceptor payloads contain request metadata, not request bodies. Keep
+	// the C size_t -> Go int conversion bounded and reject unreasonable input
+	// before allocating through C.GoBytes.
+	maxRequestPayloadBytes = 8 << 20
+	maxSessionIDBytes      = 1024
 
 	targetSessionHeader = "X-Opencode-Session"
 	targetClientHeader  = "X-Opencode-Client"
@@ -152,7 +158,15 @@ func cliproxyPluginCall(method *C.char, request *C.uint8_t, requestLen C.size_t,
 		return 1
 	}
 	var payload []byte
-	if request != nil && requestLen > 0 {
+	if !requestPayloadSizeAllowed(uint64(requestLen)) {
+		writeResponse(response, errorEnvelope("invalid_request", "request payload exceeds size limit"))
+		return 1
+	}
+	if requestLen > 0 {
+		if request == nil {
+			writeResponse(response, errorEnvelope("invalid_request", "request buffer is required"))
+			return 1
+		}
 		payload = C.GoBytes(unsafe.Pointer(request), C.int(requestLen))
 	}
 	raw, errHandle := handleMethod(C.GoString(method), payload)
@@ -183,8 +197,8 @@ func handleMethod(method string, payload []byte) ([]byte, error) {
 			Metadata: metadata{
 				Name:             pluginID,
 				Version:          pluginVersion,
-				Author:           "cpa-admin",
-				GitHubRepository: "https://github.com/ahoo/cliproxy-plugins",
+				Author:           "ahoo",
+				GitHubRepository: "https://github.com/ahoo/cpa-plugin-opencode-session-mapper",
 				Logo:             "",
 				ConfigFields:     []any{},
 			},
@@ -197,15 +211,65 @@ func handleMethod(method string, payload []byte) ([]byte, error) {
 	}
 }
 
+func requestPayloadSizeAllowed(size uint64) bool {
+	return size <= maxRequestPayloadBytes
+}
+
+// headerValue returns a normalized session identifier and whether the header
+// name was present. Empty values, invalid values, or conflicting repeated /
+// case-variant values are reported as present with an empty value so callers
+// can fail closed instead of selecting a value using randomized map order.
 func headerValue(headers map[string][]string, name string) (string, bool) {
+	matched := false
+	selected := ""
 	for key, values := range headers {
-		if strings.EqualFold(key, name) && len(values) > 0 {
-			if v := strings.TrimSpace(values[0]); v != "" {
-				return v, true
+		if !strings.EqualFold(key, name) {
+			continue
+		}
+		matched = true
+		if len(values) == 0 {
+			return "", true
+		}
+		for _, raw := range values {
+			value, valid := normalizeSessionID(raw)
+			if !valid {
+				return "", true
+			}
+			if selected == "" {
+				selected = value
+				continue
+			}
+			if selected != value {
+				return "", true
 			}
 		}
 	}
-	return "", false
+	if !matched {
+		return "", false
+	}
+	return selected, true
+}
+
+func headerExists(headers map[string][]string, name string) bool {
+	for key := range headers {
+		if strings.EqualFold(key, name) {
+			return true
+		}
+	}
+	return false
+}
+
+func normalizeSessionID(value string) (string, bool) {
+	value = strings.TrimSpace(value)
+	if value == "" || len(value) > maxSessionIDBytes {
+		return "", false
+	}
+	for _, char := range value {
+		if char < 0x20 || char == 0x7f {
+			return "", false
+		}
+	}
+	return value, true
 }
 
 func interceptHeaders(payload []byte) ([]byte, error) {
@@ -229,7 +293,10 @@ func interceptHeaders(payload []byte) ([]byte, error) {
 	}
 	var session string
 	for _, src := range sessionSources {
-		if v, ok := headerValue(req.Headers, src); ok {
+		if v, exists := headerValue(req.Headers, src); exists {
+			if v == "" {
+				return empty, nil
+			}
 			session = v
 			break
 		}
@@ -242,7 +309,7 @@ func interceptHeaders(payload []byte) ([]byte, error) {
 	}
 	out := map[string][]string{targetSessionHeader: {session}}
 	// Identify the proxy only when the client didn't identify itself.
-	if _, exists := headerValue(req.Headers, targetClientHeader); !exists {
+	if !headerExists(req.Headers, targetClientHeader) {
 		out[targetClientHeader] = []string{defaultClientValue}
 	}
 	return okEnvelopeJSON(interceptResponse{Headers: out})
@@ -276,7 +343,11 @@ func sessionFallback(metadata map[string]any) string {
 	if !ok {
 		return ""
 	}
-	return strings.TrimSpace(s)
+	value, valid := normalizeSessionID(s)
+	if !valid {
+		return ""
+	}
+	return value
 }
 
 func okEnvelopeJSON(result any) ([]byte, error) {

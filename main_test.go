@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -48,6 +49,45 @@ func TestExistingOpencodeSessionPreserved(t *testing.T) {
 	})
 	if len(resp.Headers) != 0 {
 		t.Fatalf("headers = %v, want empty (client value authoritative)", resp.Headers)
+	}
+}
+
+func TestConflictingCaseVariantSessionHeadersFailClosed(t *testing.T) {
+	resp := mustInterceptWithMeta(t,
+		map[string][]string{
+			"Session-Id": {"session-a"},
+			"session-id": {"session-b"},
+		},
+		map[string]any{"canonical_session_id": "codex:fallback-must-not-win"})
+	if len(resp.Headers) != 0 {
+		t.Fatalf("headers = %v, want empty for ambiguous session headers", resp.Headers)
+	}
+}
+
+func TestRepeatedEquivalentSessionHeadersAccepted(t *testing.T) {
+	resp := mustIntercept(t, map[string][]string{
+		"Session-Id": {"session-a", " session-a "},
+		"session-id": {"session-a"},
+	})
+	if got := resp.Headers["X-Opencode-Session"]; len(got) != 1 || got[0] != "session-a" {
+		t.Fatalf("headers = %v, want normalized session-a", resp.Headers)
+	}
+}
+
+func TestInvalidSessionHeadersFailClosed(t *testing.T) {
+	invalid := []string{
+		"contains\rreturn",
+		"contains\nnewline",
+		"contains\x00nul",
+		strings.Repeat("x", maxSessionIDBytes+1),
+	}
+	for _, value := range invalid {
+		resp := mustInterceptWithMeta(t,
+			map[string][]string{"Session-Id": {value}},
+			map[string]any{"canonical_session_id": "codex:fallback-must-not-win"})
+		if len(resp.Headers) != 0 {
+			t.Fatalf("value %q: headers = %v, want empty", value, resp.Headers)
+		}
 	}
 }
 
@@ -98,7 +138,7 @@ func TestDshSessionAffinityMapped(t *testing.T) {
 
 func TestClientHeaderPreserved(t *testing.T) {
 	resp := mustIntercept(t, map[string][]string{
-		"Session-Id":      {"s1"},
+		"Session-Id":        {"s1"},
 		"x-opencode-client": {"opencode"},
 	})
 	if _, ok := resp.Headers["X-Opencode-Client"]; ok {
@@ -138,6 +178,17 @@ func TestCanonicalSessionFallback(t *testing.T) {
 		map[string]any{"canonical_session_id": "codex:probe-capture-1"})
 	if got := resp.Headers["X-Opencode-Session"]; len(got) != 1 || got[0] != "codex:probe-capture-1" {
 		t.Fatalf("headers = %v, want fallback session id", resp.Headers)
+	}
+}
+
+func TestInvalidCanonicalSessionFallbackIgnored(t *testing.T) {
+	for _, value := range []string{"contains\nnewline", strings.Repeat("x", maxSessionIDBytes+1)} {
+		resp := mustInterceptWithMeta(t,
+			map[string][]string{"User-Agent": {"deepseek-harness/0.1.5-rc.1"}},
+			map[string]any{"canonical_session_id": value})
+		if len(resp.Headers) != 0 {
+			t.Fatalf("value %q: headers = %v, want empty", value, resp.Headers)
+		}
 	}
 }
 
@@ -192,5 +243,17 @@ func TestRegister(t *testing.T) {
 	}
 	if !reg.Capabilities.RequestInterceptor {
 		t.Fatal("want request_interceptor capability")
+	}
+	if reg.Metadata.Version != pluginVersion || reg.Metadata.Author != "ahoo" || reg.Metadata.GitHubRepository != "https://github.com/ahoo/cpa-plugin-opencode-session-mapper" {
+		t.Fatalf("metadata = %+v, want current release identity", reg.Metadata)
+	}
+}
+
+func TestRequestPayloadSizeAllowed(t *testing.T) {
+	if !requestPayloadSizeAllowed(maxRequestPayloadBytes) {
+		t.Fatal("maximum request payload should be accepted")
+	}
+	if requestPayloadSizeAllowed(maxRequestPayloadBytes + 1) {
+		t.Fatal("oversized request payload should be rejected")
 	}
 }
