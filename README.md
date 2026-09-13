@@ -20,7 +20,7 @@ This plugin restores the session signal in two stages:
    resolves the injected values onto the actual upstream wire request via
    `X-Opencode-Session: $X-Opencode-Session`.
 
-Session source priority (first non-empty wins):
+Session source priority (the first present, valid source wins):
 
 | Header | Client |
 |---|---|
@@ -40,10 +40,15 @@ Rules:
   request that identifies itself is never overridden.
 - No header at all → the **metadata fallback** below, then no-op.
 - Session identifiers are trimmed, limited to 1024 bytes, and rejected if
-  they contain control characters. Conflicting repeated or case-variant
-  values fail closed instead of depending on Go map iteration order.
+  they contain Unicode control characters. Conflicting repeated or
+  case-variant values fail closed instead of depending on Go map iteration
+  order. A present but invalid higher-priority source also blocks lower
+  sources and the metadata fallback rather than allowing header poisoning.
+- A blank `X-Opencode-Client` does not count as client identification, so the
+  plugin supplies the default `cliproxy` value.
 - Interceptor payloads larger than 8 MiB are rejected before the C `size_t`
-  length is converted for `C.GoBytes`.
+  length is converted for `C.GoBytes`; the exported ABI boundary also contains
+  panics and returns a structured failure envelope.
 
 ### Metadata fallback
 
@@ -126,26 +131,44 @@ The CLIProxyAPI runtime image is Debian-based (glibc). Building with the
 alpine Go image produces a musl-linked `.so` that fails to `dlopen` at runtime
 (`libc.musl-x86_64.so.1: cannot open shared object file`). The build script
 pins the Go patch release and container image digest, uses module read-only
-mode, and embeds VCS provenance. Use it from a clean Git checkout:
+mode, runs the full verification suite, embeds VCS provenance, and injects the
+requested registration version. Its default output is repository-local
+`dist/local/linux_amd64/`, never a live plugin mount.
+
+Use it from a clean Git checkout:
 
 ```bash
 ./build.sh
+# Override only when an explicit staging directory is desired:
+PLUGIN_OUT_DIR=/tmp/opencode-session-mapper-build ./build.sh
+# Release automation may also inject another prerelease/test identity:
+PLUGIN_VERSION=0.3.1-dev PLUGIN_OUT_DIR=/tmp/opencode-session-mapper-build ./build.sh
 ```
 
 ## Test
 
 ```bash
-go vet . && go test ./...
+test -z "$(gofmt -l ./*.go ./.github/scripts/*.go)"
+go mod verify
+go vet ./...
+go vet ./.github/scripts
+go test ./...
+go test ./.github/scripts
+go test -race ./...
 ```
 
 ## Release
 
-1. Build the `.so`.
-2. Package `<id>_<version>_<goos>_<goarch>.zip` with the library at the zip
-   root named `opencode-session-mapper.so`.
-3. Generate `checksums.txt` (sha256 of the zip).
-4. `gh release create v0.3.0 opencode-session-mapper_0.3.0_linux_amd64.zip checksums.txt`
-5. Bump `version` in `registry.json`.
+Tags matching `v*` trigger the GitHub Actions release workflow. It builds on
+native runners for Linux amd64/arm64, macOS amd64/arm64, and Windows amd64,
+then publishes immutable `<id>_<version>_<goos>_<goarch>.zip` archives plus
+`checksums.txt`. Every archive contains exactly one root library named
+`opencode-session-mapper.so`, `.dylib`, or `.dll`.
+
+`v0.3.1` supersedes `v0.3.0`: the v0.3.0 behavior was correct, but its release
+binary still registered the stale source default `0.1.0`. The corrected
+release uses a linker-injected version and verifies registration before
+packaging. Published tags and assets are never replaced.
 
 ## License
 

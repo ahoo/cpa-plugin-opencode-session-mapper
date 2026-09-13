@@ -79,11 +79,15 @@ func TestInvalidSessionHeadersFailClosed(t *testing.T) {
 		"contains\rreturn",
 		"contains\nnewline",
 		"contains\x00nul",
+		"contains" + string(rune(0x85)) + "control",
 		strings.Repeat("x", maxSessionIDBytes+1),
 	}
 	for _, value := range invalid {
 		resp := mustInterceptWithMeta(t,
-			map[string][]string{"Session-Id": {value}},
+			map[string][]string{
+				"Session-Id":   {value},
+				"X-Session-Id": {"lower-priority-must-not-win"},
+			},
 			map[string]any{"canonical_session_id": "codex:fallback-must-not-win"})
 		if len(resp.Headers) != 0 {
 			t.Fatalf("value %q: headers = %v, want empty", value, resp.Headers)
@@ -146,6 +150,27 @@ func TestClientHeaderPreserved(t *testing.T) {
 	}
 	if got := resp.Headers["X-Opencode-Session"]; len(got) != 1 || got[0] != "s1" {
 		t.Fatalf("headers = %v", resp.Headers)
+	}
+}
+
+func TestBlankClientHeaderGetsDefault(t *testing.T) {
+	cases := []struct {
+		name   string
+		values []string
+	}{
+		{name: "empty list", values: []string{}},
+		{name: "blank value", values: []string{"  "}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			resp := mustIntercept(t, map[string][]string{
+				"Session-Id":        {"s1"},
+				"x-opencode-client": tc.values,
+			})
+			if got := resp.Headers["X-Opencode-Client"]; len(got) != 1 || got[0] != defaultClientValue {
+				t.Fatalf("headers = %v, want default client identity", resp.Headers)
+			}
+		})
 	}
 }
 
@@ -241,10 +266,16 @@ func TestRegister(t *testing.T) {
 	if err := json.Unmarshal(env.Result, &reg); err != nil {
 		t.Fatal(err)
 	}
+	if reg.SchemaVersion != abiVersion {
+		t.Fatalf("schema version = %d, want %d", reg.SchemaVersion, abiVersion)
+	}
 	if !reg.Capabilities.RequestInterceptor {
 		t.Fatal("want request_interceptor capability")
 	}
-	if reg.Metadata.Version != pluginVersion || reg.Metadata.Author != "ahoo" || reg.Metadata.GitHubRepository != "https://github.com/ahoo/cpa-plugin-opencode-session-mapper" {
+	if reg.Metadata.Name != pluginID ||
+		reg.Metadata.Version != pluginVersion ||
+		reg.Metadata.Author != "ahoo" ||
+		reg.Metadata.GitHubRepository != "https://github.com/ahoo/cpa-plugin-opencode-session-mapper" {
 		t.Fatalf("metadata = %+v, want current release identity", reg.Metadata)
 	}
 }
@@ -255,5 +286,19 @@ func TestRequestPayloadSizeAllowed(t *testing.T) {
 	}
 	if requestPayloadSizeAllowed(maxRequestPayloadBytes + 1) {
 		t.Fatal("oversized request payload should be rejected")
+	}
+}
+
+func TestProcessPluginCallReturnsFailureEnvelope(t *testing.T) {
+	raw, status := processPluginCall("request.intercept_after", []byte(`{"Headers":`))
+	if status != 1 {
+		t.Fatalf("status = %d, want 1", status)
+	}
+	var env envelope
+	if err := json.Unmarshal(raw, &env); err != nil {
+		t.Fatal(err)
+	}
+	if env.OK || env.Error == nil || env.Error.Code != "plugin_error" {
+		t.Fatalf("envelope = %+v, want plugin_error", env)
 	}
 }

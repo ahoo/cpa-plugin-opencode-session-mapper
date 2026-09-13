@@ -1,0 +1,208 @@
+name: Build
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PLUGIN_ID: opencode-session-mapper
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Verify formatting and module
+        run: |
+          set -euo pipefail
+          test -z "$(gofmt -l ./*.go ./.github/scripts/*.go)"
+          go mod verify
+          python3 - <<'PY'
+          import json
+          import re
+          from pathlib import Path
+
+          source = Path("main.go").read_text()
+          match = re.search(r'^var pluginVersion = "([^"]+)"$', source, re.MULTILINE)
+          if not match:
+              raise SystemExit("linker-settable pluginVersion not found")
+          registry = json.loads(Path("registry.json").read_text())
+          if len(registry.get("plugins", [])) != 1:
+              raise SystemExit("registry must contain exactly one plugin")
+          entry = registry["plugins"][0]
+          if entry.get("id") != "opencode-session-mapper":
+              raise SystemExit("registry plugin id mismatch")
+          if entry.get("version") != match.group(1):
+              raise SystemExit("source and registry versions differ")
+          PY
+
+      - name: Vet and test
+        run: |
+          set -euo pipefail
+          go vet ./...
+          go vet ./.github/scripts
+          go test ./...
+          go test ./.github/scripts
+          go test -race ./...
+
+  build:
+    name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
+    needs: test
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+            runner: ubuntu-24.04
+            ext: so
+          - goos: linux
+            goarch: arm64
+            runner: ubuntu-24.04-arm
+            ext: so
+          - goos: darwin
+            goarch: amd64
+            runner: macos-15-intel
+            ext: dylib
+          - goos: darwin
+            goarch: arm64
+            runner: macos-15
+            ext: dylib
+          - goos: windows
+            goarch: amd64
+            runner: windows-2025
+            ext: dll
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+
+      - name: Resolve release metadata
+        run: |
+          set -euo pipefail
+          REGISTRY_VERSION="$(python -c 'import json; print(json.load(open("registry.json"))["plugins"][0]["version"])')"
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            [[ "${GITHUB_REF_NAME}" == v* ]]
+            VERSION="${GITHUB_REF_NAME#v}"
+            [[ "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+            test "${VERSION}" = "${REGISTRY_VERSION}"
+          else
+            VERSION="${REGISTRY_VERSION}-dev.${GITHUB_SHA:0:12}"
+          fi
+          echo "VERSION=${VERSION}" >> "${GITHUB_ENV}"
+          echo "LIB_NAME=${PLUGIN_ID}.${{ matrix.ext }}" >> "${GITHUB_ENV}"
+          echo "ARCHIVE_NAME=${PLUGIN_ID}_${VERSION}_${{ matrix.goos }}_${{ matrix.goarch }}.zip" >> "${GITHUB_ENV}"
+
+      - name: Build shared library
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          CGO_ENABLED=1 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} \
+            go build -trimpath -buildvcs=true -buildmode=c-shared \
+              -ldflags "-s -w -X main.pluginVersion=${VERSION}" \
+              -o "dist/${LIB_NAME}" .
+          rm -f "dist/${PLUGIN_ID}.h"
+
+      - name: Verify registration and ABI guards
+        run: python .github/scripts/verify-registration.py --library "dist/${LIB_NAME}" --version "${VERSION}"
+
+      - name: Package plugin
+        run: |
+          set -euo pipefail
+          go run ./.github/scripts/package-release.go \
+            -library "dist/${LIB_NAME}" \
+            -archive "${ARCHIVE_NAME}" \
+            -checksum "${ARCHIVE_NAME}.sha256"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARCHIVE_NAME }}
+          path: |
+            ${{ env.ARCHIVE_NAME }}
+            ${{ env.ARCHIVE_NAME }}.sha256
+          if-no-files-found: error
+
+  release:
+    name: Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs:
+      - build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Verify and publish immutable release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          cat dist/*.sha256 | LC_ALL=C sort -k2 > dist/checksums.txt
+          (cd dist && sha256sum -c checksums.txt)
+          python3 - <<'PY'
+          import pathlib
+          import zipfile
+
+          expected = {
+              "darwin": "opencode-session-mapper.dylib",
+              "linux": "opencode-session-mapper.so",
+              "windows": "opencode-session-mapper.dll",
+          }
+          archives = sorted(pathlib.Path("dist").glob("*.zip"))
+          if len(archives) != 5:
+              raise SystemExit(f"expected 5 archives, found {len(archives)}")
+          for archive in archives:
+              platform = next((name for name in expected if f"_{name}_" in archive.name), None)
+              if platform is None:
+                  raise SystemExit(f"unknown platform archive: {archive.name}")
+              with zipfile.ZipFile(archive) as bundle:
+                  if bundle.namelist() != [expected[platform]]:
+                      raise SystemExit(f"unexpected archive layout: {archive.name}: {bundle.namelist()}")
+          PY
+          if gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            echo "release ${GITHUB_REF_NAME} already exists; refusing to replace assets" >&2
+            exit 1
+          fi
+          gh release create "${GITHUB_REF_NAME}" dist/*.zip dist/checksums.txt \
+            --repo "${GITHUB_REPOSITORY}" \
+            --verify-tag \
+            --title "${GITHUB_REF_NAME}" \
+            --notes "Automated immutable release for ${GITHUB_REF_NAME}."
