@@ -1,2 +1,6 @@
-*.so
+*.dll
+*.dylib
 *.h
+*.so
+__pycache__/
+dist/

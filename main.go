@@ -45,14 +45,14 @@ import "C"
 import (
 	"encoding/json"
 	"strings"
+	"unicode"
 	"unsafe"
 )
 
 const abiVersion uint32 = 1
 
 const (
-	pluginID      = "opencode-session-mapper"
-	pluginVersion = "0.3.0"
+	pluginID = "opencode-session-mapper"
 
 	// Interceptor payloads contain request metadata, not request bodies. Keep
 	// the C size_t -> Go int conversion bounded and reject unreasonable input
@@ -64,6 +64,8 @@ const (
 	targetClientHeader  = "X-Opencode-Client"
 	defaultClientValue  = "cliproxy"
 )
+
+var pluginVersion = "0.3.1"
 
 // sessionSources lists downstream client headers that carry a stable
 // per-conversation session id, in priority order. The first non-empty
@@ -148,20 +150,27 @@ func cliproxy_plugin_init(host *C.cliproxy_host_api, plugin *C.cliproxy_plugin_a
 }
 
 //export cliproxyPluginCall
-func cliproxyPluginCall(method *C.char, request *C.uint8_t, requestLen C.size_t, response *C.cliproxy_buffer) C.int {
+func cliproxyPluginCall(method *C.char, request *C.uint8_t, requestLen C.size_t, response *C.cliproxy_buffer) (status C.int) {
+	status = 1
 	if response != nil {
 		response.ptr = nil
 		response.len = 0
 	}
+	defer func() {
+		if recover() != nil {
+			writeResponse(response, errorEnvelope("plugin_panic", "plugin call failed"))
+			status = 1
+		}
+	}()
 	if method == nil {
 		writeResponse(response, errorEnvelope("invalid_method", "method is required"))
 		return 1
 	}
-	var payload []byte
 	if !requestPayloadSizeAllowed(uint64(requestLen)) {
 		writeResponse(response, errorEnvelope("invalid_request", "request payload exceeds size limit"))
 		return 1
 	}
+	var payload []byte
 	if requestLen > 0 {
 		if request == nil {
 			writeResponse(response, errorEnvelope("invalid_request", "request buffer is required"))
@@ -169,13 +178,17 @@ func cliproxyPluginCall(method *C.char, request *C.uint8_t, requestLen C.size_t,
 		}
 		payload = C.GoBytes(unsafe.Pointer(request), C.int(requestLen))
 	}
-	raw, errHandle := handleMethod(C.GoString(method), payload)
-	if errHandle != nil {
-		writeResponse(response, errorEnvelope("plugin_error", errHandle.Error()))
-		return 1
-	}
+	raw, callStatus := processPluginCall(C.GoString(method), payload)
 	writeResponse(response, raw)
-	return 0
+	return C.int(callStatus)
+}
+
+func processPluginCall(method string, payload []byte) ([]byte, int) {
+	raw, errHandle := handleMethod(method, payload)
+	if errHandle != nil {
+		return errorEnvelope("plugin_error", errHandle.Error()), 1
+	}
+	return raw, 0
 }
 
 //export cliproxyPluginFree
@@ -250,10 +263,15 @@ func headerValue(headers map[string][]string, name string) (string, bool) {
 	return selected, true
 }
 
-func headerExists(headers map[string][]string, name string) bool {
-	for key := range headers {
-		if strings.EqualFold(key, name) {
-			return true
+func headerHasValue(headers map[string][]string, name string) bool {
+	for key, values := range headers {
+		if !strings.EqualFold(key, name) {
+			continue
+		}
+		for _, value := range values {
+			if strings.TrimSpace(value) != "" {
+				return true
+			}
 		}
 	}
 	return false
@@ -265,7 +283,7 @@ func normalizeSessionID(value string) (string, bool) {
 		return "", false
 	}
 	for _, char := range value {
-		if char < 0x20 || char == 0x7f {
+		if unicode.IsControl(char) {
 			return "", false
 		}
 	}
@@ -309,7 +327,7 @@ func interceptHeaders(payload []byte) ([]byte, error) {
 	}
 	out := map[string][]string{targetSessionHeader: {session}}
 	// Identify the proxy only when the client didn't identify itself.
-	if !headerExists(req.Headers, targetClientHeader) {
+	if !headerHasValue(req.Headers, targetClientHeader) {
 		out[targetClientHeader] = []string{defaultClientValue}
 	}
 	return okEnvelopeJSON(interceptResponse{Headers: out})
