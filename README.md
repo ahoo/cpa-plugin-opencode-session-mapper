@@ -39,6 +39,11 @@ Rules:
 - A client-supplied header always outranks the metadata fallback below; a
   request that identifies itself is never overridden.
 - No header at all → the **metadata fallback** below, then no-op.
+- Session identifiers are trimmed, limited to 1024 bytes, and rejected if
+  they contain control characters. Conflicting repeated or case-variant
+  values fail closed instead of depending on Go map iteration order.
+- Interceptor payloads larger than 8 MiB are rejected before the C `size_t`
+  length is converted for `C.GoBytes`.
 
 ### Metadata fallback
 
@@ -119,7 +124,9 @@ docker logs cli-proxy-api | grep opencode-session-mapper
 
 The CLIProxyAPI runtime image is Debian-based (glibc). Building with the
 alpine Go image produces a musl-linked `.so` that fails to `dlopen` at runtime
-(`libc.musl-x86_64.so.1: cannot open shared object file`). Use a glibc image:
+(`libc.musl-x86_64.so.1: cannot open shared object file`). The build script
+pins the Go patch release and container image digest, uses module read-only
+mode, and embeds VCS provenance. Use it from a clean Git checkout:
 
 ```bash
 ./build.sh
