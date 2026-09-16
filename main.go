@@ -54,10 +54,19 @@ const abiVersion uint32 = 1
 const (
 	pluginID = "opencode-session-mapper"
 
-	// Interceptor payloads contain request metadata, not request bodies. Keep
-	// the C size_t -> Go int conversion bounded and reject unreasonable input
-	// before allocating through C.GoBytes.
-	maxRequestPayloadBytes = 8 << 20
+	// maxRequestPayloadBytes caps the serialized native interceptor envelope.
+	// Fixed and non-configurable. The host serializes the whole
+	// RequestInterceptRequest as JSON, including Body ([]byte marshals as a
+	// base64 string at roughly 4/3 of the raw body), so legitimate
+	// Host-shaped payloads carrying multi-megabyte bodies exceed 8 MiB on the
+	// wire. This plugin only maps headers and metadata, so interceptRequest
+	// keeps a narrow JSON projection that omits Body (the decoder scans but
+	// does not base64-decode or retain unknown fields) - but the envelope gate
+	// must still admit the full 64 MiB. The check runs before any pointer
+	// dereference, before any allocation, and before the C.size_t -> C.int
+	// conversion feeding C.GoBytes, keeping that conversion bounded
+	// (64 MiB is far below 2 GiB).
+	maxRequestPayloadBytes = 64 << 20
 	maxSessionIDBytes      = 1024
 
 	targetSessionHeader = "X-Opencode-Session"
@@ -65,7 +74,7 @@ const (
 	defaultClientValue  = "cliproxy"
 )
 
-var pluginVersion = "0.3.1"
+var pluginVersion = "0.3.2"
 
 // sessionSources lists downstream client headers that carry a stable
 // per-conversation session id, in priority order. The first non-empty
@@ -120,6 +129,11 @@ type capabilities struct {
 	RequestInterceptor bool `json:"request_interceptor"`
 }
 
+// interceptRequest is a narrow projection of the host's
+// RequestInterceptRequest envelope. Body is intentionally absent: the host
+// may attach the full request body (base64-encoded by encoding/json), and
+// the plugin never needs it - only headers and metadata are mapped. The JSON
+// decoder scans unknown fields but does not base64-decode or retain Body.
 type interceptRequest struct {
 	RequestID string              `json:"RequestID"`
 	Headers   map[string][]string `json:"Headers"`
@@ -152,10 +166,11 @@ func cliproxy_plugin_init(host *C.cliproxy_host_api, plugin *C.cliproxy_plugin_a
 //export cliproxyPluginCall
 func cliproxyPluginCall(method *C.char, request *C.uint8_t, requestLen C.size_t, response *C.cliproxy_buffer) (status C.int) {
 	status = 1
-	if response != nil {
-		response.ptr = nil
-		response.len = 0
+	if response == nil {
+		return 1
 	}
+	response.ptr = nil
+	response.len = 0
 	defer func() {
 		if recover() != nil {
 			writeResponse(response, errorEnvelope("plugin_panic", "plugin call failed"))
@@ -166,6 +181,9 @@ func cliproxyPluginCall(method *C.char, request *C.uint8_t, requestLen C.size_t,
 		writeResponse(response, errorEnvelope("invalid_method", "method is required"))
 		return 1
 	}
+	// Envelope gate first: reject oversized input before any pointer
+	// dereference, before any allocation, and before narrowing C.size_t to
+	// C.int for C.GoBytes.
 	if !requestPayloadSizeAllowed(uint64(requestLen)) {
 		writeResponse(response, errorEnvelope("invalid_request", "request payload exceeds size limit"))
 		return 1
