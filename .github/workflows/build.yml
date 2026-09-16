@@ -21,19 +21,30 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
 
       - name: Setup Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
           go-version-file: go.mod
           cache: true
 
+      - name: Setup Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.13'
+
       - name: Verify formatting and module
+        shell: bash
         run: |
           set -euo pipefail
-          test -z "$(gofmt -l ./*.go ./.github/scripts/*.go)"
+          test -z "$(gofmt -l ./*.go ./.github/scripts/*.go ./scripts/official-host/cmd/harness/*.go)"
+          git diff --check
           go mod verify
+          go mod tidy -diff
           python3 - <<'PY'
           import json
           import re
@@ -51,9 +62,12 @@ jobs:
               raise SystemExit("registry plugin id mismatch")
           if entry.get("version") != match.group(1):
               raise SystemExit("source and registry versions differ")
+          if not re.search(r"^\s*maxRequestPayloadBytes\s*=\s*64\s*<<\s*20$", source, re.MULTILINE):
+              raise SystemExit("source native-envelope cap is not 64 MiB")
           PY
 
       - name: Vet and test
+        shell: bash
         run: |
           set -euo pipefail
           go vet ./...
@@ -61,57 +75,45 @@ jobs:
           go test ./...
           go test ./.github/scripts
           go test -race ./...
+          python3 -m unittest discover -s .github/scripts -p 'test_*.py'
 
-  build:
-    name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
+  build-linux:
+    name: Build linux/${{ matrix.goarch }}
     needs: test
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - goos: linux
-            goarch: amd64
+          - goarch: amd64
             runner: ubuntu-24.04
-            ext: so
-          - goos: linux
-            goarch: arm64
+          - goarch: arm64
             runner: ubuntu-24.04-arm
-            ext: so
-          - goos: darwin
-            goarch: amd64
-            runner: macos-15-intel
-            ext: dylib
-          - goos: darwin
-            goarch: arm64
-            runner: macos-15
-            ext: dylib
-          - goos: windows
-            goarch: amd64
-            runner: windows-2025
-            ext: dll
     defaults:
       run:
         shell: bash
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
 
       - name: Setup Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
           go-version-file: go.mod
           cache: true
 
       - name: Setup Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: '3.13'
 
       - name: Resolve release metadata
         run: |
           set -euo pipefail
-          REGISTRY_VERSION="$(python -c 'import json; print(json.load(open("registry.json"))["plugins"][0]["version"])')"
+          REGISTRY_VERSION="$(python3 -c 'import json; print(json.load(open("registry.json"))["plugins"][0]["version"])')"
           if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
             [[ "${GITHUB_REF_NAME}" == v* ]]
             VERSION="${GITHUB_REF_NAME#v}"
@@ -121,7 +123,152 @@ jobs:
             VERSION="${REGISTRY_VERSION}-dev.${GITHUB_SHA:0:12}"
           fi
           echo "VERSION=${VERSION}" >> "${GITHUB_ENV}"
-          echo "LIB_NAME=${PLUGIN_ID}.${{ matrix.ext }}" >> "${GITHUB_ENV}"
+          echo "LIB_NAME=${PLUGIN_ID}.so" >> "${GITHUB_ENV}"
+          echo "ARCHIVE_NAME=${PLUGIN_ID}_${VERSION}_linux_${{ matrix.goarch }}.zip" >> "${GITHUB_ENV}"
+
+      - name: Build shared library
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          CGO_ENABLED=1 GOOS=linux GOARCH=${{ matrix.goarch }} \
+            go build -trimpath -buildvcs=true -buildmode=c-shared \
+              -ldflags "-s -w -X main.pluginVersion=${VERSION}" \
+              -o "dist/${LIB_NAME}" .
+          rm -f "dist/${PLUGIN_ID}.h"
+
+      - name: Verify registration and ABI guards
+        run: python3 .github/scripts/verify-registration.py --library "dist/${LIB_NAME}" --version "${VERSION}"
+
+      - name: Record official Host candidate identity
+        if: matrix.goarch == 'amd64'
+        run: |
+          set -euo pipefail
+          printf '%s\n' "${VERSION}" > dist/candidate-version.txt
+          printf '%s\n' "${GITHUB_SHA}" > dist/candidate-revision.txt
+          sha256sum "dist/${LIB_NAME}" | cut -d' ' -f1 > dist/candidate-sha256.txt
+
+      - name: Upload official Host candidate
+        if: matrix.goarch == 'amd64'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: official-host-candidate-linux-amd64
+          path: |
+            dist/${{ env.PLUGIN_ID }}.so
+            dist/candidate-version.txt
+            dist/candidate-revision.txt
+            dist/candidate-sha256.txt
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Package plugin
+        run: |
+          set -euo pipefail
+          go run ./.github/scripts/package-release.go \
+            -library "dist/${LIB_NAME}" \
+            -archive "dist/${ARCHIVE_NAME}" \
+            -checksum "dist/${ARCHIVE_NAME}.sha256"
+
+      - name: Record release provenance
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/release-manifest.py build \
+            --version "${VERSION}" --revision "${GITHUB_SHA}" \
+            --goos linux --goarch "${{ matrix.goarch }}" --extension so \
+            --archive "dist/${ARCHIVE_NAME}" \
+            --library "dist/${LIB_NAME}" \
+            --go-version "$(go version)" \
+            --runner-image "${ImageOS:-unknown}:${ImageVersion:-unknown}" \
+            --builder-image "github-hosted:${ImageOS:-unknown}:${ImageVersion:-unknown}" \
+            --output "dist/build-metadata_linux_${{ matrix.goarch }}.json"
+
+      - name: Upload release target
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-linux-${{ matrix.goarch }}
+          path: |
+            dist/${{ env.ARCHIVE_NAME }}
+            dist/${{ env.ARCHIVE_NAME }}.sha256
+            dist/build-metadata_linux_${{ matrix.goarch }}.json
+          if-no-files-found: error
+          retention-days: 7
+
+  build-native:
+    name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
+    needs: test
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: darwin
+            goarch: amd64
+            runner: macos-15-intel
+            extension: dylib
+          - goos: darwin
+            goarch: arm64
+            runner: macos-15
+            extension: dylib
+          - goos: windows
+            goarch: amd64
+            runner: windows-2025
+            extension: dll
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Setup Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.13'
+
+      - name: Verify Windows C toolchain
+        if: matrix.goos == 'windows'
+        shell: pwsh
+        run: |
+          $gcc = @(
+            'C:\mingw64\bin\gcc.exe',
+            'C:\msys64\mingw64\bin\gcc.exe'
+          ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $gcc) {
+            $discovered = Get-Command gcc.exe -ErrorAction SilentlyContinue
+            if ($discovered) {
+              $gcc = $discovered.Source
+            }
+          }
+          if (-not $gcc) {
+            throw 'preinstalled MinGW-w64 GCC is unavailable'
+          }
+          & $gcc --version | Select-Object -First 1
+          Split-Path -Parent $gcc | Out-File -FilePath $env:GITHUB_PATH -Append
+
+      - name: Resolve release metadata
+        run: |
+          set -euo pipefail
+          REGISTRY_VERSION="$(python3 -c 'import json; print(json.load(open("registry.json"))["plugins"][0]["version"])')"
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            [[ "${GITHUB_REF_NAME}" == v* ]]
+            VERSION="${GITHUB_REF_NAME#v}"
+            [[ "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+            test "${VERSION}" = "${REGISTRY_VERSION}"
+          else
+            VERSION="${REGISTRY_VERSION}-dev.${GITHUB_SHA:0:12}"
+          fi
+          echo "VERSION=${VERSION}" >> "${GITHUB_ENV}"
+          echo "LIB_NAME=${PLUGIN_ID}.${{ matrix.extension }}" >> "${GITHUB_ENV}"
           echo "ARCHIVE_NAME=${PLUGIN_ID}_${VERSION}_${{ matrix.goos }}_${{ matrix.goarch }}.zip" >> "${GITHUB_ENV}"
 
       - name: Build shared library
@@ -135,74 +282,189 @@ jobs:
           rm -f "dist/${PLUGIN_ID}.h"
 
       - name: Verify registration and ABI guards
-        run: python .github/scripts/verify-registration.py --library "dist/${LIB_NAME}" --version "${VERSION}"
+        run: python3 .github/scripts/verify-registration.py --library "dist/${LIB_NAME}" --version "${VERSION}"
 
       - name: Package plugin
         run: |
           set -euo pipefail
           go run ./.github/scripts/package-release.go \
             -library "dist/${LIB_NAME}" \
-            -archive "${ARCHIVE_NAME}" \
-            -checksum "${ARCHIVE_NAME}.sha256"
+            -archive "dist/${ARCHIVE_NAME}" \
+            -checksum "dist/${ARCHIVE_NAME}.sha256"
 
-      - name: Upload build artifact
-        uses: actions/upload-artifact@v4
+      - name: Record release provenance
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/release-manifest.py build \
+            --version "${VERSION}" --revision "${GITHUB_SHA}" \
+            --goos "${{ matrix.goos }}" --goarch "${{ matrix.goarch }}" \
+            --extension "${{ matrix.extension }}" \
+            --archive "dist/${ARCHIVE_NAME}" \
+            --library "dist/${LIB_NAME}" \
+            --go-version "$(go version)" \
+            --runner-image "${ImageOS:-unknown}:${ImageVersion:-unknown}" \
+            --builder-image "github-hosted:${ImageOS:-unknown}:${ImageVersion:-unknown}" \
+            --output "dist/build-metadata_${{ matrix.goos }}_${{ matrix.goarch }}.json"
+
+      - name: Upload release target
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: ${{ env.ARCHIVE_NAME }}
+          name: release-${{ matrix.goos }}-${{ matrix.goarch }}
           path: |
-            ${{ env.ARCHIVE_NAME }}
-            ${{ env.ARCHIVE_NAME }}.sha256
+            dist/${{ env.ARCHIVE_NAME }}
+            dist/${{ env.ARCHIVE_NAME }}.sha256
+            dist/build-metadata_${{ matrix.goos }}_${{ matrix.goarch }}.json
           if-no-files-found: error
+          retention-days: 7
+
+  official-host:
+    name: Official Host integration
+    needs: build-linux
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout exact source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Download exact Linux amd64 candidate
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: official-host-candidate-linux-amd64
+          path: ${{ runner.temp }}/official-host-candidate
+
+      - name: Verify candidate identity and run isolated Host
+        shell: bash
+        run: |
+          set -euo pipefail
+          CANDIDATE_DIR="${RUNNER_TEMP}/official-host-candidate"
+          VERSION="$(tr -d '\r\n' < "${CANDIDATE_DIR}/candidate-version.txt")"
+          REVISION="$(tr -d '\r\n' < "${CANDIDATE_DIR}/candidate-revision.txt")"
+          EXPECTED_SHA256="$(tr -d '\r\n' < "${CANDIDATE_DIR}/candidate-sha256.txt")"
+          [[ "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-dev(\.[0-9a-f]{12})?)?$ ]]
+          [[ "${REVISION}" =~ ^[0-9a-f]{40}$ ]]
+          [[ "${EXPECTED_SHA256}" =~ ^[0-9a-f]{64}$ ]]
+          test "${REVISION}" = "${GITHUB_SHA}"
+          test "$(sha256sum "${CANDIDATE_DIR}/${PLUGIN_ID}.so" | cut -d' ' -f1)" = "${EXPECTED_SHA256}"
+          ./scripts/official-host/run.sh \
+            --library "${CANDIDATE_DIR}/${PLUGIN_ID}.so" \
+            --version "${VERSION}" \
+            --revision "${REVISION}" \
+            --output "${RUNNER_TEMP}/official-host-integration.json"
+
+      - name: Upload sanitized Host report
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: official-host-integration
+          path: ${{ runner.temp }}/official-host-integration.json
+          if-no-files-found: error
+          retention-days: 7
 
   release:
     name: Release
     if: startsWith(github.ref, 'refs/tags/v')
     needs:
-      - build
+      - build-linux
+      - build-native
+      - official-host
     runs-on: ubuntu-24.04
+    concurrency:
+      group: release-${{ github.ref }}
+      cancel-in-progress: false
     permissions:
       contents: write
     steps:
-      - name: Download build artifacts
-        uses: actions/download-artifact@v4
+      - name: Checkout tagged source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.13'
+
+      - name: Download exact release targets
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: release-*
           path: dist
           merge-multiple: true
 
-      - name: Verify and publish immutable release
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
+      - name: Download exact official Host report
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: official-host-integration
+          path: integration
+
+      - name: Assemble and verify release bundle
+        shell: bash
         run: |
           set -euo pipefail
-          cat dist/*.sha256 | LC_ALL=C sort -k2 > dist/checksums.txt
-          (cd dist && sha256sum -c checksums.txt)
-          python3 - <<'PY'
-          import pathlib
-          import zipfile
+          [[ "${GITHUB_REF_NAME}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          VERSION="${GITHUB_REF_NAME#v}"
+          test "$(git rev-list -n 1 "${GITHUB_REF_NAME}")" = "${GITHUB_SHA}"
+          git fetch --no-tags origin main:refs/remotes/origin/main
+          test "$(git rev-parse origin/main)" = "${GITHUB_SHA}"
+          REGISTRY_VERSION="$(python3 -c 'import json; print(json.load(open("registry.json"))["plugins"][0]["version"])')"
+          test "${VERSION}" = "${REGISTRY_VERSION}"
+          SOURCE_VERSION="$(python3 -c 'import re; print(re.search(r"^var pluginVersion = \"([^\"]+)\"", open("main.go").read(), re.MULTILINE).group(1))')"
+          test "${VERSION}" = "${SOURCE_VERSION}"
+          for checksum in dist/*.sha256; do
+            (cd dist && sha256sum -c "$(basename "${checksum}")")
+          done
+          python3 .github/scripts/release-manifest.py assemble \
+            --version "${VERSION}" --revision "${GITHUB_SHA}" \
+            --input-dir dist \
+            --integration-report integration/official-host-integration.json \
+            --output dist/release-manifest.json
+          (
+            cd dist
+            sha256sum *.zip release-manifest.json | LC_ALL=C sort -k2 > checksums.txt
+            test "$(wc -l < checksums.txt | tr -d '[:space:]')" = 6
+            sha256sum -c checksums.txt
+          )
 
-          expected = {
-              "darwin": "opencode-session-mapper.dylib",
-              "linux": "opencode-session-mapper.so",
-              "windows": "opencode-session-mapper.dll",
-          }
-          archives = sorted(pathlib.Path("dist").glob("*.zip"))
-          if len(archives) != 5:
-              raise SystemExit(f"expected 5 archives, found {len(archives)}")
-          for archive in archives:
-              platform = next((name for name in expected if f"_{name}_" in archive.name), None)
-              if platform is None:
-                  raise SystemExit(f"unknown platform archive: {archive.name}")
-              with zipfile.ZipFile(archive) as bundle:
-                  if bundle.namelist() != [expected[platform]]:
-                      raise SystemExit(f"unexpected archive layout: {archive.name}: {bundle.namelist()}")
-          PY
+      - name: Publish without replacement
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The workflow token cannot read the Administration-scoped repository
+          # immutability setting. The operator verifies it before tagging; this
+          # job verifies the resulting Release's immutable flag after publish.
           if gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
-            echo "release ${GITHUB_REF_NAME} already exists; refusing to replace assets" >&2
+            printf 'release %s already exists; refusing to replace assets\n' "${GITHUB_REF_NAME}" >&2
             exit 1
           fi
-          gh release create "${GITHUB_REF_NAME}" dist/*.zip dist/checksums.txt \
+          gh release create "${GITHUB_REF_NAME}" \
+            dist/*.zip \
+            dist/checksums.txt \
+            dist/release-manifest.json \
             --repo "${GITHUB_REPOSITORY}" \
             --verify-tag \
+            --draft \
             --title "${GITHUB_REF_NAME}" \
             --notes "Automated immutable release for ${GITHUB_REF_NAME}."
+          release_id="$(gh api --paginate \
+            "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+            --jq ".[] | select(.tag_name == \"${GITHUB_REF_NAME}\") | .id")"
+          [[ "${release_id}" =~ ^[0-9]+$ ]]
+          gh api --method PATCH \
+            "repos/${GITHUB_REPOSITORY}/releases/${release_id}" \
+            -F draft=false >/dev/null
+          test "$(gh api \
+            "repos/${GITHUB_REPOSITORY}/releases/${release_id}" \
+            --jq '.immutable')" = true

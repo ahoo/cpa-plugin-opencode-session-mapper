@@ -281,11 +281,15 @@ func TestRegister(t *testing.T) {
 }
 
 func TestRequestPayloadSizeAllowed(t *testing.T) {
-	if !requestPayloadSizeAllowed(maxRequestPayloadBytes) {
-		t.Fatal("maximum request payload should be accepted")
+	for _, size := range []uint64{0, maxRequestPayloadBytes - 1, maxRequestPayloadBytes} {
+		if !requestPayloadSizeAllowed(size) {
+			t.Fatalf("payload size %d should be accepted", size)
+		}
 	}
-	if requestPayloadSizeAllowed(maxRequestPayloadBytes + 1) {
-		t.Fatal("oversized request payload should be rejected")
+	for _, size := range []uint64{maxRequestPayloadBytes + 1, ^uint64(0)} {
+		if requestPayloadSizeAllowed(size) {
+			t.Fatalf("payload size %d should be rejected", size)
+		}
 	}
 }
 
@@ -300,5 +304,99 @@ func TestProcessPluginCallReturnsFailureEnvelope(t *testing.T) {
 	}
 	if env.OK || env.Error == nil || env.Error.Code != "plugin_error" {
 		t.Fatalf("envelope = %+v, want plugin_error", env)
+	}
+}
+
+// Host-shaped envelopes carry the full request body: encoding/json marshals
+// []byte as a base64 string (~4/3 expansion), so a 6,378,698-byte body
+// serializes past the old 8 MiB gate. The plugin only maps headers/metadata
+// through a narrow projection that omits Body, so mapping still succeeds on
+// both interceptor methods.
+func TestHostShapedLargeBodyPayloadMapped(t *testing.T) {
+	const sessionFixture = "123e4567-e89b-12d3-a456-426614174000"
+	for _, method := range []string{"request.intercept_before", "request.intercept_after"} {
+		raw, err := json.Marshal(struct {
+			RequestID string              `json:"RequestID"`
+			TraceID   string              `json:"TraceID"`
+			Source    string              `json:"SourceFormat"`
+			Headers   map[string][]string `json:"Headers"`
+			Metadata  map[string]any      `json:"Metadata"`
+			Body      []byte              `json:"Body"`
+		}{
+			RequestID: "large-body",
+			TraceID:   "trace",
+			Source:    "claude",
+			Headers:   map[string][]string{"X-Claude-Code-Session-Id": {sessionFixture}},
+			Body:      []byte(strings.Repeat("a", 6378698)),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(raw) <= 8<<20 {
+			t.Fatal("fixture does not exceed the previous payload gate")
+		}
+		if !requestPayloadSizeAllowed(uint64(len(raw))) {
+			t.Fatal("host-shaped envelope rejected by payload gate")
+		}
+		out, err := handleMethod(method, raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var env envelope
+		if err := json.Unmarshal(out, &env); err != nil {
+			t.Fatal(err)
+		}
+		if !env.OK {
+			t.Fatal("host-shaped envelope not accepted")
+		}
+		var resp interceptResponse
+		if err := json.Unmarshal(env.Result, &resp); err != nil {
+			t.Fatal(err)
+		}
+		got := resp.Headers["X-Opencode-Session"]
+		if len(got) != 1 || got[0] != sessionFixture {
+			t.Fatal("host-shaped envelope session not mapped")
+		}
+		client := resp.Headers["X-Opencode-Client"]
+		if len(client) != 1 || client[0] != defaultClientValue {
+			t.Fatal("host-shaped envelope client header not mapped")
+		}
+	}
+}
+
+// A valid 36-byte UUID-shaped client session id maps on both interceptor
+// passes; the mapped header carries the client value through unchanged.
+func TestClaudeCodeUUIDSessionMappedBothMethods(t *testing.T) {
+	const sessionFixture = "123e4567-e89b-12d3-a456-426614174000"
+	if len(sessionFixture) != 36 {
+		t.Fatal("session fixture must be 36 bytes")
+	}
+	for _, method := range []string{"request.intercept_before", "request.intercept_after"} {
+		raw, err := json.Marshal(interceptRequest{
+			RequestID: "uuid-shape",
+			Headers:   map[string][]string{"X-Claude-Code-Session-Id": {sessionFixture}},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		out, err := handleMethod(method, raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var env envelope
+		if err := json.Unmarshal(out, &env); err != nil {
+			t.Fatal(err)
+		}
+		if !env.OK {
+			t.Fatal("uuid-shaped session envelope not accepted")
+		}
+		var resp interceptResponse
+		if err := json.Unmarshal(env.Result, &resp); err != nil {
+			t.Fatal(err)
+		}
+		got := resp.Headers["X-Opencode-Session"]
+		if len(got) != 1 || got[0] != sessionFixture {
+			t.Fatal("uuid-shaped session not mapped")
+		}
 	}
 }

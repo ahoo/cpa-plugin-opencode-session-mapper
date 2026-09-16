@@ -46,9 +46,16 @@ Rules:
   sources and the metadata fallback rather than allowing header poisoning.
 - A blank `X-Opencode-Client` does not count as client identification, so the
   plugin supplies the default `cliproxy` value.
-- Interceptor payloads larger than 8 MiB are rejected before the C `size_t`
-  length is converted for `C.GoBytes`; the exported ABI boundary also contains
-  panics and returns a structured failure envelope.
+- Serialized native interceptor envelopes larger than 64 MiB (fixed,
+  non-configurable cap) are rejected before any pointer dereference, before
+  any allocation, and before the C `size_t` -> `C.int` conversion feeding
+  `C.GoBytes`; the exported ABI boundary also contains panics and returns a
+  structured failure envelope. The plugin decodes only a narrow projection
+  (`RequestID`/`Headers`/`Metadata`) and does not base64-decode or retain
+  `Body`, which the host base64-encodes into the envelope at roughly 4/3 of
+  the raw body size — so
+  legitimate requests carrying multi-megabyte bodies are accepted and still
+  map normally.
 
 ### Metadata fallback
 
@@ -142,7 +149,7 @@ Use it from a clean Git checkout:
 # Override only when an explicit staging directory is desired:
 PLUGIN_OUT_DIR=/tmp/opencode-session-mapper-build ./build.sh
 # Release automation may also inject another prerelease/test identity:
-PLUGIN_VERSION=0.3.1-dev PLUGIN_OUT_DIR=/tmp/opencode-session-mapper-build ./build.sh
+PLUGIN_VERSION=0.3.2-dev PLUGIN_OUT_DIR=/tmp/opencode-session-mapper-build ./build.sh
 ```
 
 ## Test
@@ -169,6 +176,12 @@ then publishes immutable `<id>_<version>_<goos>_<goarch>.zip` archives plus
 binary still registered the stale source default `0.1.0`. The corrected
 release uses a linker-injected version and verifies registration before
 packaging. Published tags and assets are never replaced.
+
+`v0.3.2` supersedes `v0.3.1`: raises the fixed envelope gate from 8 MiB to
+64 MiB so legitimate Host-shaped payloads carrying multi-megabyte
+(base64-encoded) bodies are accepted into normal header/metadata mapping;
+mapping behavior is otherwise unchanged. Published tags and assets are never
+replaced.
 
 ## License
 

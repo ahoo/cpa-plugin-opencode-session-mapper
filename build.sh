@@ -4,7 +4,7 @@ set -euo pipefail
 
 SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PLUGIN_NAME="opencode-session-mapper"
-PLUGIN_VERSION="${PLUGIN_VERSION:-0.3.1}"
+PLUGIN_VERSION="${PLUGIN_VERSION:-0.3.2}"
 OUT_DIR="${PLUGIN_OUT_DIR:-${SRC_DIR}/dist/local/linux_amd64}"
 
 # Pin both the Go patch release and the multi-architecture image digest so a
