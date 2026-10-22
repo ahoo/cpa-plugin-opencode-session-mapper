@@ -1,14 +1,40 @@
 # cpa-plugin-opencode-session-mapper
 
 CLIProxyAPI request interceptor plugin: forwards client conversation session
-ids to OpenCode Zen as `x-opencode-session`.
+ids to OpenCode (Zen / Console) as `x-opencode-session`.
 
-OpenCode Zen uses `x-opencode-session` (one stable ID per conversation) for
-sticky routing and prompt-cache affinity. Since 09/06, requests missing this
-header may error. But requests that pass through CLIProxyAPI lose the header:
-executors rebuild outbound headers from scratch and only forward a small
-whitelist (`Version` / `Session_id` / `User-Agent` on the codex path, nothing
-extra on the openai-compat path).
+## Scope and access requirements
+
+This is a **session-header mapper**. It preserves conversation affinity on an
+otherwise supported upstream connection; it does not grant model access or
+free-tier eligibility.
+
+| Concern | What this plugin does |
+|---|---|
+| Session propagation | Maps a recognized client session header, or the host's metadata fallback, to `X-Opencode-Session`. Credential-level forwarding is still required. |
+| API compatibility | Does not change the upstream URL, model, protocol, message body, tools, streaming, or token limits. Configure these in the client / CLIProxyAPI for the documented API. |
+| Authentication and free-tier access | Does not create credentials, grant quota, or bypass upstream access checks. `X-Opencode-Client: cliproxy` identifies the proxy; it is not authorization. |
+
+A `MissingSessionID` response can indicate a session propagation problem.
+A 403 saying that the free tier is restricted to OpenCode is a different
+upstream rejection and is **not evidence that session mapping failed**.
+The error text alone also does not establish which upstream check rejected
+the request.
+
+See [troubleshooting and supported access](docs/troubleshooting.md) for the
+Issue #5 investigation, current official API guidance, and a diagnostic
+checklist. In particular, the HTTP 200 results in
+[opencode2api PR #1](https://github.com/ahoo/opencode2api/pull/1) belong to that
+separate gateway, not to this plugin.
+
+## How session mapping works
+
+OpenCode uses a stable session ID for conversation routing and prompt-cache
+affinity. Its current [harness documentation](https://opencode.ai/v2/docs/console/harnesses/#sessions)
+also recognizes several native client headers. This plugin is useful when
+the proxy path drops those headers: the CLIProxyAPI executor versions
+originally investigated rebuilt outbound headers and forwarded only a small
+whitelist. Check the behavior of your installed host version.
 
 This plugin restores the session signal in two stages:
 
@@ -79,15 +105,19 @@ hash to the same value, so they share one upstream session. This affects
 prompt-cache affinity only, never correctness. Distinguishing such conversations
 requires the client to send a real session id.
 
-Verified live against zen:
+### Historical validation
+
+The original README recorded the following live checks against Zen. They are
+evidence for the tested session propagation paths at that time, not a current
+free-model availability guarantee or a reproduction / fix of Issue #5:
 
 - `muse-free` (codex `/v1/responses`, client `Session-Id`) and `mimo-free`
   (openai-compat `/v1/chat/completions`, client `X-DeepSeek-Harness-Session-Id`)
-  arrive upstream carrying the mapped `X-Opencode-Session`.
+  were recorded arriving upstream carrying the mapped `X-Opencode-Session`.
 - `deepseek-flash` with **no** session header at all (dsh 0.1.5,
-  `/v1/chat/completions`) now returns 200 instead of upstream
-  `MissingSessionID` 400; the derived id stays stable as a conversation grows
-  turn by turn and differs between conversations.
+  `/v1/chat/completions`) was recorded returning 200 instead of upstream
+  `MissingSessionID` 400, with a derived id stable across turns and different
+  between the tested conversations.
 
 ## Capability
 
@@ -108,10 +138,14 @@ plugins:
       priority: 1
 ```
 
-Then add `$` forwarding headers to every zen credential so the injected
-values reach the wire. On each `codex-api-key` entry whose `base-url`
-contains `opencode.ai`, and on the `openai-compatibility` provider pointing
-at `https://opencode.ai/zen/v1`:
+First configure a supported OpenCode API endpoint, matching protocol/model,
+and any required credentials using the
+[official API documentation](https://opencode.ai/v2/docs/console/api/inference/).
+The old `/zen/v1` example is not a universal current endpoint.
+
+Then add `$` forwarding headers to each relevant OpenCode credential/provider
+entry (for example, the applicable `codex-api-key` or
+`openai-compatibility` entry), so the injected values reach the wire:
 
 ```yaml
 headers:
@@ -126,11 +160,15 @@ absent the header is omitted. Restart CLIProxyAPI (plugins load at startup):
 docker restart cli-proxy-api
 ```
 
-Verify:
+Check that the plugin loaded:
 
 ```bash
 docker logs cli-proxy-api | grep opencode-session-mapper
 ```
+
+A load message does not prove that headers reached the upstream service.
+Follow the [wire-level diagnostic steps](docs/troubleshooting.md#check-session-propagation)
+to verify forwarding separately from API access.
 
 ## Build
 
