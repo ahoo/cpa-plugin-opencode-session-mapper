@@ -9,7 +9,7 @@ OUT_DIR="${PLUGIN_OUT_DIR:-${SRC_DIR}/dist/local/linux_amd64}"
 
 # Pin both the Go patch release and the multi-architecture image digest so a
 # release build cannot silently change underneath an existing version.
-GO_IMAGE="${PLUGIN_GO_IMAGE:-golang:1.26.8-bookworm@sha256:9fdc884aacc3bec89b20ffc69f4bb369c78210e3e4f600387b5128b12c199f81}"
+GO_IMAGE="${PLUGIN_GO_IMAGE:-golang:1.26.11-bookworm@sha256:dc40a13b61304647ed7e5d581d246b86413dfc29d63c6d018310feb93cd98fc0}"
 
 if [[ ! "${PLUGIN_VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
   printf 'invalid plugin version: %s\n' "${PLUGIN_VERSION}" >&2
